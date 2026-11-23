@@ -84,7 +84,33 @@ class DispatchAction(Base):
     status: Mapped[str] = mapped_column(String(20), default="queued")
     instruction: Mapped[str] = mapped_column(Text)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+    severe_probability: Mapped[float | None] = mapped_column(Float, nullable=True)
     case: Mapped[DelayCase] = relationship(back_populates="actions")
+
+class SevereDelayActual(Base):
+    """主管确认的严重延误实绩，按版本追加；迟到记录与更正都以新版本入账。"""
+    __tablename__ = "severe_delay_actuals"
+    __table_args__ = (UniqueConstraint("case_id", "revision", name="uq_severe_actual_revision"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    case_id: Mapped[int] = mapped_column(ForeignKey("delay_cases.id"), index=True)
+    revision: Mapped[int] = mapped_column(Integer, default=1)
+    severe_actual: Mapped[int] = mapped_column(Integer)
+    note: Mapped[str] = mapped_column(String(500), default="")
+    recorded_by: Mapped[str] = mapped_column(String(40))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+
+class ShiftReportSignoff(Base):
+    """班报签发快照；签发后组内更正只影响当前结果，已签发数字原样保留。"""
+    __tablename__ = "shift_report_signoffs"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    terminal: Mapped[str] = mapped_column(String(60), index=True)
+    shift_key: Mapped[str] = mapped_column(String(24), index=True)
+    shift_label: Mapped[str] = mapped_column(String(40))
+    snapshot: Mapped[dict] = mapped_column(JSON)
+    signed_by: Mapped[str] = mapped_column(String(40))
+    note: Mapped[str] = mapped_column(String(500), default="")
+    signed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
 
 class AnalysisJob(Base):
     __tablename__ = "analysis_jobs"

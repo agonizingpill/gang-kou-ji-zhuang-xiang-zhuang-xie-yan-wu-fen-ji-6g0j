@@ -1,12 +1,16 @@
 from datetime import datetime, timezone, timedelta
 from sqlalchemy import select
 from src.database import Base, SessionLocal, engine
-from src.models import User, VesselCall, ContainerCheck, GateEvent, DelayCase, DispatchAction
+from src.models import User, VesselCall, ContainerCheck, GateEvent, DelayCase, DispatchAction, SevereDelayActual, ShiftReportSignoff
 from src.security import hash_password
 
 
 def dt(day, hour, minute=0):
     return datetime(2026, 11, day, hour, minute, tzinfo=timezone.utc)
+
+def bj(day, hour, minute=0):
+    """按北京墙上时间构造时刻，存储为 UTC（减 8 小时）。"""
+    return datetime(2026, 11, day, hour, minute, tzinfo=timezone(timedelta(hours=8))).astimezone(timezone.utc)
 
 def seed():
     Base.metadata.create_all(engine)
@@ -66,14 +70,98 @@ def seed():
         if not db.execute(select(DispatchAction).where(DispatchAction.action_type == "冷藏箱优先卸船")).scalar_one_or_none():
             case = db.execute(select(DelayCase).where(DelayCase.case_no == "CASE-HAI-001")).scalar_one()
             case.status = "dispatched"; case.final_level = "major"
-            case.model_output = {"label": "major", "confidence": 0.84, "seed": 42, "note": "seed演示结果"}
-            db.add(DispatchAction(case_id=case.id, action_type="冷藏箱优先卸船", assignee="C12夜班桥吊组", due_at=dt(21, 8, 30), status="queued", instruction="将MSCU100002置于前两吊，完成后回报调度台"))
+            case.model_output = {"label": "major", "confidence": 0.84, "seed": 42,
+                                 "probabilities": {"normal": 0.04, "watch": 0.08, "major": 0.84, "critical": 0.04},
+                                 "note": "seed演示结果"}
+            db.add(DispatchAction(case_id=case.id, action_type="冷藏箱优先卸船", assignee="C12夜班桥吊组", due_at=bj(21, 8, 30), status="queued", instruction="将MSCU100002置于前两吊，完成后回报调度台", created_at=bj(21, 7, 15), severe_probability=0.04))
         if not db.execute(select(DispatchAction).where(DispatchAction.action_type == "查验单证补录")).scalar_one_or_none():
             case = db.execute(select(DelayCase).where(DelayCase.case_no == "CASE-TRI-002")).scalar_one()
-            db.add(DispatchAction(case_id=case.id, action_type="查验单证补录", assignee="海关联络岗", due_at=dt(21, 10), status="queued", instruction="等查验结束后补传查验回执"))
+            case.final_level = "watch"; case.status = "classified"
+            case.model_output = {"label": "watch", "confidence": 0.71, "seed": 42,
+                                 "probabilities": {"normal": 0.12, "watch": 0.71, "major": 0.14, "critical": 0.03}}
+            db.add(DispatchAction(case_id=case.id, action_type="查验单证补录", assignee="海关联络岗", due_at=bj(21, 10), status="queued", instruction="等查验结束后补传查验回执", created_at=bj(21, 8, 40), severe_probability=0.03))
+        db.flush()
+        _seed_shift_report_demo(db, vessel_by_no)
         db.commit()
     finally:
         db.close()
+
+
+def _model_output(label: str, critical: float):
+    """构造带完整概率分布的演示模型输出。"""
+    rest = round(1.0 - critical, 4)
+    probs = {"normal": 0.0, "watch": 0.0, "major": 0.0, "critical": round(critical, 4)}
+    probs[label if label != "critical" else "major"] = rest if label != "critical" else 0.0
+    return {"label": label, "confidence": round(max(probs.values()), 4), "seed": 42,
+            "probabilities": probs, "note": "班报演示数据"}
+
+
+def _seed_shift_report_demo(db, vessel_by_no):
+    """跨码头、跨班次的班报演示：含迟到实绩、更正与已签发快照对照。"""
+    if db.execute(select(SevereDelayActual)).first() or db.execute(select(ShiftReportSignoff)).first():
+        return
+    demo_cases = [
+        # 案件号, 船次, 模型等级, 严重概率, 派工时刻(北京墙上时间), 指令, 责任人
+        ("CASE-HAI-S1", "CALL-HAI-20261121", "critical", 0.82, bj(21, 7, 20), "桥吊增援", "C12早班桥吊组"),
+        ("CASE-HAI-S2", "CALL-HAI-20261121", "major", 0.35, bj(21, 9, 5), "堆场疏解", "C12早班堆场组"),
+        ("CASE-HAI-S3", "CALL-HAI-20261121", "watch", 0.12, bj(21, 12, 40), "窗口监控", "C12早班调度岗"),
+        ("CASE-TRI-S1", "CALL-TRI-20261121", "critical", 0.66, bj(21, 14, 25), "查验加急", "C08中班海关联络岗"),
+        ("CASE-TRI-S2", "CALL-TRI-20261121", "major", 0.28, bj(21, 17, 10), "单证复核", "C08中班单证岗"),
+        ("CASE-PEARL-N1", "CALL-PEARL-20261121", "critical", 0.74, bj(21, 22, 30), "危险品隔离", "C15夜班应急组"),
+        ("CASE-NORTH-N2", "CALL-NORTH-20261121", "watch", 0.09, bj(22, 1, 15), "晚靠泊值守", "C03夜班调度岗"),
+    ]
+    case_by_no = {}
+    for case_no, call_no, label, critical, dispatched, action_type, assignee in demo_cases:
+        if db.execute(select(DelayCase).where(DelayCase.case_no == case_no)).scalar_one_or_none():
+            continue
+        case = DelayCase(vessel_id=vessel_by_no[call_no].id, case_no=case_no,
+                         requested_level=label, final_level=label, status="dispatched",
+                         reason="班报演示案件", model_output=_model_output(label, critical))
+        db.add(case); db.flush()
+        db.add(DispatchAction(case_id=case.id, action_type=action_type, assignee=assignee,
+                              due_at=dispatched + timedelta(hours=2), status="queued",
+                              instruction="班报演示处置指令", created_at=dispatched,
+                              severe_probability=round(critical, 4)))
+        case_by_no[case_no] = case
+    db.flush()
+
+    def add_actual(case_no, revision, value, when, note):
+        db.add(SevereDelayActual(case_id=case_by_no[case_no].id, revision=revision,
+                                 severe_actual=value, note=note, recorded_by="supervisor",
+                                 created_at=when))
+
+    # 海陵港CCT 早班（2026-11-21-A）：两条已报实绩 + 一条未报；S2 先报 0 后更正为 1
+    add_actual("CASE-HAI-S1", 1, 1, bj(21, 9, 0), "现场确认严重延误")
+    add_actual("CASE-HAI-S2", 1, 0, bj(21, 11, 0), "初判未达严重延误")
+    add_actual("CASE-HAI-S2", 2, 1, bj(21, 13, 30), "主管复查后更正为严重延误")
+    # HAI-S3 不报实绩，演示“未报实绩单列、不计入误差”
+    # 中班：TRI-S1 为晚到的实绩（中班派工，次日才补录，仍归原班次）
+    add_actual("CASE-TRI-S1", 1, 1, bj(22, 9, 12), "迟到补录：查验确实导致严重延误")
+    add_actual("CASE-TRI-S2", 1, 0, bj(21, 18, 0), "未达严重延误")
+    # 夜班两条实绩
+    add_actual("CASE-PEARL-N1", 1, 1, bj(22, 2, 0), "危险品船期严重延误")
+    add_actual("CASE-NORTH-N2", 1, 0, bj(22, 4, 30), "晚靠泊未构成严重延误")
+    db.flush()
+
+    # 中班在迟到实绩补录前签发：快照冻结签发时数字（TRI-S1 当时尚未补录，计为未报）
+    if not db.execute(select(ShiftReportSignoff).where(
+            ShiftReportSignoff.terminal == "海陵港CCT",
+            ShiftReportSignoff.shift_key == "2026-11-21-B")).scalar_one_or_none():
+        db.add(ShiftReportSignoff(
+            terminal="海陵港CCT", shift_key="2026-11-21-B", shift_label="2026-11-21 中班",
+            signed_by="supervisor", note="中班交班签发，TRI-S1 实绩待补录",
+            snapshot={
+                "scored_count": 1, "pending_count": 1, "without_probability_count": 0,
+                "mse": round((0.28 - 0.0) ** 2, 4),
+                "scored_cases": [{
+                    "case_no": "CASE-TRI-S2", "severe_probability": 0.28,
+                    "severe_actual": 0, "squared_error": round((0.28 - 0.0) ** 2, 4),
+                    "actual_revision": 1,
+                }],
+                "pending_cases": ["CASE-TRI-S1"],
+            },
+            signed_at=bj(21, 22, 5),
+        ))
 
 if __name__ == "__main__":
     seed()

@@ -20,7 +20,7 @@ def vessel_dict(v: VesselCall, db):
 
 def case_dict(c: DelayCase, db):
     jobs = db.execute(select(AnalysisJob).where(AnalysisJob.case_id == c.id).order_by(AnalysisJob.id.desc())).scalars().all()
-    actions = [{"id": a.id, "action_type": a.action_type, "assignee": a.assignee, "due_at": a.due_at.isoformat(), "status": a.status, "instruction": a.instruction} for a in c.actions]
+    actions = [{"id": a.id, "action_type": a.action_type, "assignee": a.assignee, "due_at": a.due_at.isoformat(), "status": a.status, "instruction": a.instruction, "created_at": a.created_at.isoformat() if a.created_at else None, "severe_probability": a.severe_probability} for a in c.actions]
     return {"id": c.id, "case_no": c.case_no, "vessel_id": c.vessel_id, "vessel": c.vessel.call_no if c.vessel else "", "vessel_name": c.vessel.vessel_name if c.vessel else "", "requested_level": c.requested_level, "final_level": c.final_level, "status": c.status, "reason": c.reason, "feature_snapshot": c.feature_snapshot, "model_output": c.model_output, "exception_reason": c.exception_reason, "jobs": [{"id": j.id, "status": j.status, "result": j.result, "error": j.error, "finished_at": j.finished_at.isoformat() if j.finished_at else None} for j in jobs], "actions": actions}
 
 @router.post("/auth/login")
@@ -125,8 +125,13 @@ def create_action(case_id: int, payload: DispatchIn, db: Session = Depends(get_d
     case = db.get(DelayCase, case_id)
     if not case: raise HTTPException(404, "延误案件不存在")
     if case.status not in {"classified", "dispatched"} or not case.final_level: raise HTTPException(409, "案件尚未完成分级，不能生成调度动作")
-    a = DispatchAction(case_id=case.id, **payload.model_dump()); case.status = "dispatched"; db.add(a); db.flush(); log(db, user, "create_dispatch_action", "dispatch_action", a.id, payload.action_type); db.commit()
-    return {"id": a.id, "case_id": case.id, "status": a.status}
+    severe_probability = None
+    if isinstance(case.model_output, dict):
+        severe_probability = (case.model_output.get("probabilities") or {}).get("critical")
+    now = datetime.now(timezone.utc)
+    a = DispatchAction(case_id=case.id, created_at=now, severe_probability=severe_probability, **payload.model_dump())
+    case.status = "dispatched"; db.add(a); db.flush(); log(db, user, "create_dispatch_action", "dispatch_action", a.id, payload.action_type); db.commit()
+    return {"id": a.id, "case_id": case.id, "status": a.status, "created_at": a.created_at.isoformat(), "severe_probability": a.severe_probability}
 
 @router.post("/actions/{action_id}/complete")
 def complete_action(action_id: int, db: Session = Depends(get_db), user: User = Depends(require_roles("operator", "supervisor"))):
